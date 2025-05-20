@@ -1,7 +1,7 @@
 from mygraphlib import Graph
 
 
-def test_graph_basics():
+def test_graph_basics() -> None:
     # Create simple graph
     g = Graph()
     g.add_edge("A", "B")
