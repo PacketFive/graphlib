@@ -1,0 +1,23 @@
+[project]
+name = "graphlib"
+version = "0.1.0"
+description = "A minimal graph library for educational use"
+authors = [{ name = "Lev Pakhomov", email = "pakhomovlev@gmail.com" }]
+requires-python = ">=3.13.3"
+
+[tool.black]
+line-length = 88
+target-version = ["py310"]
+include = '\.py$'
+
+[tool.mypy]
+strict = true
+ignore_missing_imports = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra"
+
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
