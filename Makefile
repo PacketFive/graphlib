@@ -1,4 +1,4 @@
-.PHONY: test lint format
+.PHONY: test lint format visualize
 
 PYTHONPATH := .
 
@@ -10,3 +10,6 @@ lint:
 
 format:
 	black mygraphlib/ tests/
+
+visualize-nx:
+	PYTHONPATH=$(PYTHONPATH) python visualize_with_networkx.py
