@@ -5,7 +5,7 @@ from .ospf import (
     RouterLSA, RouterLSALink, RouterLSALinkType,
     NetworkLSA, IPAddress, RouterID,
     AreaID, OSPFInterfaceState, OSPFInterface, OSPFRouter,
-    build_ospf_graph_from_routers, OSPFArea
+    build_ospf_graph_from_lsdb, OSPFArea, get_network_address
 )
 
 __all__ = [
@@ -14,5 +14,5 @@ __all__ = [
     "RouterLSA", "RouterLSALink", "RouterLSALinkType",
     "NetworkLSA", "IPAddress", "RouterID",
     "AreaID", "OSPFInterfaceState", "OSPFInterface", "OSPFRouter",
-    "build_ospf_graph_from_routers", "OSPFArea"
+    "build_ospf_graph_from_lsdb", "OSPFArea", "get_network_address"
 ] 

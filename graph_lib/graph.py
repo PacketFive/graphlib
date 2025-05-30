@@ -76,6 +76,21 @@ class Graph:
             return self._adjacency_list[u][v]
         return None
 
+    def has_edge(self, u: Hashable, v: Hashable) -> bool:
+        """
+        Checks if a directed edge exists from node u to node v.
+
+        Args:
+            u: The starting node of the edge.
+            v: The ending node of the edge.
+
+        Returns:
+            True if the edge exists, False otherwise.
+        """
+        if u not in self._adjacency_list:
+            return False
+        return v in self._adjacency_list[u]
+
     def neighbors(self, node_id: Hashable) -> Iterator[Hashable]:
         """
         Returns an iterator over the neighbors of a given node.
@@ -114,4 +129,23 @@ class Graph:
         count = 0
         for node in self._adjacency_list:
             count += len(self._adjacency_list[node])
-        return count 
+        return count
+
+    def get_all_edges(self, include_weights: bool = False) -> Iterator[tuple]:
+        """Returns an iterator over all edges in the graph."""
+        for u, neighbors in self._adjacency_list.items():
+            for v, weight in neighbors.items():
+                if include_weights:
+                    yield (u, v, weight)
+                else:
+                    yield (u, v)
+
+    def has_node(self, node_id: Hashable) -> bool:
+        """Check if a node exists in the graph."""
+        return node_id in self._nodes
+
+    def has_edge(self, u: Hashable, v: Hashable) -> bool:
+        """Check if an edge exists between two nodes."""
+        if u not in self._adjacency_list:
+            return False
+        return v in self._adjacency_list[u] 

@@ -1,251 +1,109 @@
-# Graph Library
+# GraphLib: A Network Graph and OSPF Simulation Library
 
-A Python library for graph manipulation and algorithms, with a focus on network-related applications including conceptual OSPF data structures and topology building.
+GraphLib is a Python library for creating, manipulating, and analyzing network graphs. It includes a foundational graph module, implementations of graph algorithms like Dijkstra's, and a module for simulating the Open Shortest Path First (OSPF) routing protocol. Additionally, it features an importer to create network topologies using Mininet and simulate OSPF on them.
 
 ## Features
 
--   **Core Graph Structure**: A flexible `Graph` class supporting directed graphs, weighted edges, and storage of arbitrary Python objects as node data.
--   **Graph Algorithms**:
-    -   Dijkstra's Algorithm: For finding the shortest paths in a weighted graph.
-    -   Breadth-First Search (BFS): For shortest path in terms of edges and graph traversal.
-    -   Depth-First Search (DFS): For pathfinding, cycle detection, and graph traversal.
--   **OSPF Functionality (Conceptual)**:
-    -   Data structures for OSPF Link State Advertisements (LSAs - Type 1 Router LSA, Type 2 Network LSA).
-    -   Representations for OSPF Routers, Interfaces, and Areas.
-    -   Function to build an OSPF intra-area topology graph from router configurations (currently P2P links).
--   **Unit Tests**: Comprehensive test suite using `pytest` to ensure reliability.
--   **Pip Installable**: Packaged using `setuptools` and `pyproject.toml` for easy installation.
+*   **Generic Graph Library (`graph_lib/graph.py`):**
+    *   Create directed graphs.
+    *   Add nodes and weighted edges.
+    *   Store arbitrary data with nodes.
+    *   Basic graph inspection methods (node count, edge count, neighbors, etc.).
+*   **Graph Algorithms (`graph_lib/algorithms.py`):**
+    *   Dijkstra's algorithm for finding shortest paths.
+*   **OSPF Simulation (`graph_lib/ospf.py`):**
+    *   Dataclasses for OSPF concepts: LSAs (Router, Network), Interfaces, Routers, Areas.
+    *   LSA origination (Router LSA, Network LSA).
+    *   LSDB management within an OSPF Area.
+    *   Construction of an OSPF topology graph from an LSDB.
+    *   SPF (Dijkstra's) calculation to produce routing tables.
+*   **Mininet Importer & OSPF Simulation Runner (`graph_lib/mininet_importer.py`):**
+    *   Defines a sample Mininet topology.
+    *   Extracts topology information and converts it to OSPF data structures.
+    *   Performs a simplified Designated Router (DR) election.
+    *   Runs an OSPF simulation on the Mininet topology:
+        *   LSA generation and LSDB population.
+        *   SPF calculation.
+        *   Displays resulting routing tables.
+    *   Optionally converts the Mininet topology to a generic `Graph` object.
+    *   Allows control over Mininet CLI interaction via the `INTERACTIVE_MININET_CLI` environment variable.
 
-## Installation
+## Project Structure
 
-Currently, the library can be installed from source or used directly in a project.
+```
+graphlib/
+├── graph_lib/
+│   ├── __init__.py
+│   ├── algorithms.py   # Graph algorithms (Dijkstra)
+│   ├── graph.py        # Core graph data structure
+│   ├── mininet_importer.py # Mininet topology creation and OSPF simulation
+│   └── ospf.py         # OSPF protocol simulation components
+├── tests/
+│   └── ...             # Unit tests (structure may vary)
+├── docs/
+│   ├── user_guide.md
+│   └── developer_guide.md
+├── README.md           # This file
+└── requirements.txt    # Project dependencies (if any beyond standard Mininet)
+```
 
-To install dependencies for development (like `pytest`):
+## Getting Started
+
+### Prerequisites
+
+*   Python 3.x
+*   Mininet (for running `mininet_importer.py`)
+*   A Python virtual environment is recommended.
+
+### Installation / Setup
+
+1.  **Clone the repository (if applicable):**
+    ```bash
+    git clone <repository_url>
+    cd graphlib
+    ```
+
+2.  **Set up a Python virtual environment:**
+    ```bash
+    python3 -m venv /opt/pyvenv  # Or your preferred path
+    source /opt/pyvenv/bin/activate
+    ```
+    If you have a `requirements.txt`, install dependencies:
+    ```bash
+    pip install -r requirements.txt
+    ```
+
+### Running the Mininet OSPF Simulation
+
+The main demonstration script is `graph_lib/mininet_importer.py`. It creates a Mininet topology, configures OSPF on the routers, and simulates the protocol.
+
+To run the simulation (from the project root directory, e.g., `graphlib/`):
+
+*   **If your virtual environment is at `/opt/pyvenv/` and not activated:**
+    ```bash
+    sudo /opt/pyvenv/bin/python -m graph_lib.mininet_importer
+    ```
+*   **If your virtual environment is activated in the current shell:**
+    ```bash
+    sudo python -m graph_lib.mininet_importer
+    ```
+
+To interact with the Mininet CLI after the script runs the simulation, set the environment variable:
 ```bash
-# Ensure you are in your project's virtual environment
-pip install -r requirements.txt
+sudo INTERACTIVE_MININET_CLI=1 /opt/pyvenv/bin/python -m graph_lib.mininet_importer
 ```
 
-(Once published to PyPI, installation will be via `pip install graph-lib`)
+## Documentation
 
-## Usage Examples
+For more detailed information, please refer to:
 
-### Basic Graph Operations
-
-```python
-from graph_lib import Graph
-
-# Create a graph
-g = Graph()
-
-# Add nodes
-g.add_node("RouterA", data={"model": "Cisco 123", "location": "NY"})
-g.add_node("RouterB")
-g.add_node("RouterC", data={"location": "LA"})
-
-# Add weighted edges
-g.add_edge("RouterA", "RouterB", weight=10)
-g.add_edge("RouterB", "RouterC", weight=5)
-g.add_edge("RouterA", "RouterC", weight=20) # A direct, more expensive link
-
-# Get node data
-print(f"Router A Data: {g.get_node_data('RouterA')}")
-
-# Get neighbors
-print(f"Neighbors of RouterA: {list(g.neighbors('RouterA'))}")
-
-# Check if a node exists
-if "RouterB" in g:
-    print("RouterB exists in the graph.")
-
-# Get number of nodes and edges
-print(f"Number of nodes: {len(g)}")
-print(f"Number of edges: {g.get_edges_count()}")
-```
-
-### Using Graph Algorithms
-
-```python
-from graph_lib import Graph, dijkstra, bfs, dfs
-
-# (Assuming graph 'g' is created and populated as above)
-
-# Dijkstra's Algorithm (shortest path by weight)
-# Path from RouterA to RouterC
-dist_ac, path_ac_dijkstra = dijkstra(g, "RouterA", "RouterC")
-if dist_ac is not None:
-    print(f"Dijkstra: Shortest path from RouterA to RouterC is {path_ac_dijkstra} with cost {dist_ac}")
-    # Expected: ['RouterA', 'RouterB', 'RouterC'] with cost 15
-
-# All shortest paths from RouterA
-distances_from_a, predecessors_a = dijkstra(g, "RouterA")
-print(f"Distances from RouterA: {distances_from_a}")
-
-# Breadth-First Search (BFS - shortest path by number of edges)
-path_ac_bfs, _ = bfs(g, "RouterA", "RouterC")
-if path_ac_bfs:
-    print(f"BFS: Path from RouterA to RouterC is {path_ac_bfs}")
-    # Expected: Can be ['RouterA', 'RouterC'] if it explores that first, or ['RouterA', 'RouterB', 'RouterC']
-    # If ['RouterA', 'RouterC'] is found, len=2. If ['RouterA', 'RouterB', 'RouterC'], len=3.
-    # BFS finds shortest in terms of *number of edges*.
-
-# Get all nodes reachable by BFS from RouterA
-visited_bfs = bfs(g, "RouterA")
-print(f"Nodes reachable from RouterA (BFS order): {visited_bfs}")
-
-# Depth-First Search (DFS - finds a path)
-path_ac_dfs, _ = dfs(g, "RouterA", "RouterC")
-if path_ac_dfs:
-    print(f"DFS: Path from RouterA to RouterC is {path_ac_dfs}")
-
-# Get all nodes reachable by DFS from RouterA
-visited_dfs = dfs(g, "RouterA")
-print(f"Nodes reachable from RouterA (DFS order): {visited_dfs}")
-```
-
-### OSPF Functionality (Conceptual Example)
-
-```python
-from graph_lib import (
-    OSPFRouter, OSPFInterface, OSPFArea, 
-    RouterID, IPAddress, AreaID, OSPFInterfaceState,
-    build_ospf_graph_from_routers, dijkstra
-)
-
-# Define Routers and their OSPF interfaces
-r1 = OSPFRouter(router_id=RouterID("1.1.1.1"))
-r1.add_interface(OSPFInterface(
-    ip_address=IPAddress("10.0.1.1"), 
-    network_mask=IPAddress("255.255.255.252"), 
-    area_id=AreaID("0.0.0.0"), 
-    cost=10, 
-    network_type=OSPFInterfaceState.POINT_TO_POINT, 
-    neighbor_router_id=RouterID("2.2.2.2")
-))
-
-r2 = OSPFRouter(router_id=RouterID("2.2.2.2"))
-r2.add_interface(OSPFInterface(
-    ip_address=IPAddress("10.0.1.2"), 
-    network_mask=IPAddress("255.255.255.252"), 
-    area_id=AreaID("0.0.0.0"), 
-    cost=10, 
-    network_type=OSPFInterfaceState.POINT_TO_POINT, 
-    neighbor_router_id=RouterID("1.1.1.1")
-))
-r2.add_interface(OSPFInterface(
-    ip_address=IPAddress("10.0.2.1"), 
-    network_mask=IPAddress("255.255.255.252"), 
-    area_id=AreaID("0.0.0.0"), 
-    cost=5, 
-    network_type=OSPFInterfaceState.POINT_TO_POINT, 
-    neighbor_router_id=RouterID("3.3.3.3")
-))
-
-r3 = OSPFRouter(router_id=RouterID("3.3.3.3"))
-r3.add_interface(OSPFInterface(
-    ip_address=IPAddress("10.0.2.2"), 
-    network_mask=IPAddress("255.255.255.252"), 
-    area_id=AreaID("0.0.0.0"), 
-    cost=5, 
-    network_type=OSPFInterfaceState.POINT_TO_POINT, 
-    neighbor_router_id=RouterID("2.2.2.2")
-))
-
-all_routers = [r1, r2, r3]
-
-# Create an OSPF Area object
-area0 = OSPFArea(area_id=AreaID("0.0.0.0"))
-
-# Build the intra-area topology graph
-area0.build_intra_area_topology(all_domain_routers=all_routers)
-ospf_topology_graph = area0.topology_graph
-
-if ospf_topology_graph:
-    print(f"OSPF Area 0 has {len(ospf_topology_graph)} routers in its topology.")
-    # Calculate shortest path from R1 to R3 in Area 0
-    dist_r1_r3, path_r1_r3 = dijkstra(ospf_topology_graph, RouterID("1.1.1.1"), RouterID("3.3.3.3"))
-    if dist_r1_r3 is not None:
-        print(f"Shortest path from R1 to R3 in Area 0: {path_r1_r3} with OSPF cost {dist_r1_r3}")
-        # Expected: ['1.1.1.1', '2.2.2.2', '3.3.3.3'] with cost 15
-```
-
-## API Reference
-
-### `graph_lib.Graph`
-
-Represents a directed graph.
-
--   `__init__(self)`: Initializes an empty graph.
--   `add_node(self, node_id: Hashable, data: Optional[Any] = None)`: Adds a node. Raises `ValueError` if node exists.
--   `get_node_data(self, node_id: Hashable) -> Optional[Any]`: Retrieves data for a node. Raises `ValueError` if node doesn't exist.
--   `add_edge(self, u: Hashable, v: Hashable, weight: float = 1.0)`: Adds a directed edge from `u` to `v`. Creates nodes if they don't exist.
--   `get_edge_weight(self, u: Hashable, v: Hashable) -> Optional[float]`: Returns weight of edge `u`->`v`, or `None`.
--   `neighbors(self, node_id: Hashable) -> Iterator[Hashable]`: Iterator over neighbors of `node_id`. Raises `ValueError` if node doesn't exist.
--   `get_all_nodes(self) -> Iterator[Hashable]`: Iterator over all node IDs.
--   `__contains__(self, node_id: Hashable) -> bool`: Checks if `node_id` is in the graph (`node in graph`).
--   `__len__(self) -> int`: Returns number of nodes (`len(graph)`).
--   `get_nodes_count(self) -> int`: Returns number of nodes.
--   `get_edges_count(self) -> int`: Returns number of edges.
-
-### `graph_lib.algorithms`
-
--   `dijkstra(graph: Graph, start_node: Hashable, end_node: Optional[Hashable] = None)`:
-    -   Calculates shortest paths using Dijkstra's algorithm.
-    -   If `end_node` is `None`: returns `(distances_dict, predecessors_dict)` for all reachable nodes.
-    -   If `end_node` is specified: returns `(cost, path_list)`. `cost` is `None` if not reachable.
--   `bfs(graph: Graph, start_node: Hashable, target_node: Optional[Hashable] = None)`:
-    -   Performs Breadth-First Search.
-    -   If `target_node` is `None`: returns a list of visited nodes in BFS order.
-    -   If `target_node` is specified: returns `(path_list, predecessors_dict)`. `path_list` is `None` if not reachable.
--   `dfs(graph: Graph, start_node: Hashable, target_node: Optional[Hashable] = None)`:
-    -   Performs Depth-First Search.
-    -   If `target_node` is `None`: returns a list of visited nodes in DFS (pre-order) traversal.
-    -   If `target_node` is specified: returns `(path_list, predecessors_dict)`. `path_list` is `None` if not reachable.
-
-### `graph_lib.ospf` (Conceptual OSPF Structures)
-
-**Type Aliases:**
--   `IPAddress = NewType("IPAddress", str)`
--   `RouterID = NewType("RouterID", str)` (Typically an IPv4 formatted string)
--   `AreaID = NewType("AreaID", str)` (Typically an IPv4 formatted string or uint32)
-
-**Enums:**
--   `LSAType(Enum)`: OSPF LSA types (e.g., `ROUTER_LSA`, `NETWORK_LSA`).
--   `RouterLSALinkType(Enum)`: Types of links in a Router LSA (e.g., `POINT_TO_POINT`, `TRANSIT_NETWORK`).
--   `OSPFInterfaceState(Enum)`: OSPF network types and interface states (e.g., `POINT_TO_POINT`, `BROADCAST`, `DR`, `BDR`).
-
-**Dataclasses:**
--   `LSAHeader`: Base class for LSA headers. Fields: `ls_age`, `options`, `ls_type`, `link_state_id`, `advertising_router`, `ls_sequence_number`, `ls_checksum`, `length`.
--   `RouterLSALink`: Represents a link in a Router LSA. Fields: `link_id`, `link_data`, `link_type`, `metric`.
--   `RouterLSA(LSAHeader)`: Represents a Type 1 Router LSA. Fields: `is_virtual_link_endpoint`, `is_asbr`, `is_abr`, `links: List[RouterLSALink]`.
--   `NetworkLSA(LSAHeader)`: Represents a Type 2 Network LSA. Fields: `network_mask`, `attached_routers: List[RouterID]`.
--   `OSPFInterface`: Configuration for an OSPF interface. Fields: `ip_address`, `network_mask`, `area_id`, `network_type`, `cost`, `current_ospf_state`, `hello_interval`, `dead_interval`, `priority`, `neighbor_router_id`, `neighbor_interface_ip`.
--   `OSPFRouter`: Represents an OSPF router. Fields: `router_id`, `interfaces: List[OSPFInterface]`.
-    -   `add_interface(self, interface: OSPFInterface)`
-    -   `originate_router_lsa(self, area_id: AreaID) -> Optional[RouterLSA]` (Conceptual placeholder)
-    -   `originate_network_lsa(self, interface_ip: IPAddress) -> Optional[NetworkLSA]` (Conceptual placeholder)
--   `OSPFArea`: Represents an OSPF area. Fields: `area_id`, `routers_in_area: List[OSPFRouter]`, `topology_graph: Optional[Graph]`, `lsdb`.
-    -   `build_intra_area_topology(self, all_domain_routers: Optional[List[OSPFRouter]] = None)`
-    -   `add_lsa_to_lsdb(self, lsa: Union[RouterLSA, NetworkLSA, LSAHeader])`
-
-**Functions:**
--   `build_ospf_graph_from_routers(routers: List[OSPFRouter], target_area_id: AreaID) -> Graph`:
-    -   Constructs an intra-area OSPF topology graph from router configurations.
-    -   Currently supports Point-to-Point links.
-
-## Running Tests
-
-To run the unit tests, ensure `pytest` is installed (see Installation) and then run from the project root directory:
-
-```bash
-pytest
-```
+*   **[User Guide](./docs/user_guide.md):** Instructions on using the library and running simulations.
+*   **[Developer Guide](./docs/developer_guide.md):** Information for contributors and those looking to understand the internals.
 
 ## Contributing
 
-(Placeholder for contribution guidelines - e.g., fork, branch, PR)
+Please refer to the [Developer Guide](./docs/developer_guide.md) for contribution guidelines.
 
 ## License
 
-This project is licensed under the MIT License - see the `LICENSE` file for details (if one is created).
-(Currently, `pyproject.toml` specifies MIT License classification). 
+(Specify your project's license here, e.g., MIT, Apache 2.0) 

@@ -4,11 +4,18 @@ from typing import List, Union, NewType, Optional, Dict, Tuple
 import ipaddress # Import the ipaddress module
 from graph_lib.graph import Graph # Ensure Graph is imported if not already at top level of module
 from .algorithms import dijkstra # Import dijkstra
+from collections import namedtuple, defaultdict # Ensure namedtuple and defaultdict are imported
 
 # Represents an IP address, typically stored as a string for simplicity here.
 # In a more complete implementation, this might be an IPv4Address or IPv6Address object.
 IPAddress = NewType("IPAddress", str)
 RouterID = NewType("RouterID", str) # OSPF Router ID, typically in IPv4 format
+NetworkID = NewType("NetworkID", str) # Represents a network segment, e.g., "10.0.1.0/24"
+PseudoNodeID = NewType("PseudoNodeID", str) # Represents a pseudo-node, e.g., "transit_10.0.1.3"
+NodeID = Union[RouterID, NetworkID, PseudoNodeID] # General ID for nodes in SPF graph
+
+# Define SPFResult named tuple for storing routing information
+SPFResult = namedtuple("SPFResult", ["cost", "next_hop_router_id"])
 
 class LSAType(Enum):
     ROUTER_LSA = 1
@@ -282,12 +289,14 @@ def build_ospf_graph_from_lsdb(
             if node_data: # Should exist
                 node_data['is_abr'] = lsa_content.is_abr
                 node_data['is_asbr'] = lsa_content.is_asbr
-                # g.add_node(adv_router, data=node_data) # Re-add to update, or modify in place if Graph allows
 
             for link in lsa_content.links:
                 if link.link_type == RouterLSALinkType.POINT_TO_POINT:
                     neighbor_router_id = link.link_id
-                    if isinstance(neighbor_router_id, RouterID) and neighbor_router_id not in g:
+                    # For P2P links, link_id is RouterID (a str). Add if not in graph.
+                    # Removed problematic isinstance(neighbor_router_id, RouterID) check.
+                    # We assume it's a str because RouterID = NewType("RouterID", str)
+                    if neighbor_router_id not in g: # Check if node_id (str) is already a node
                         g.add_node(neighbor_router_id, data={'type': 'router', 'is_abr': False, 'is_asbr': False})
                 # Other link types might also imply router existence, but P2P is explicit.
         
@@ -315,12 +324,11 @@ def build_ospf_graph_from_lsdb(
                 if link.link_type == RouterLSALinkType.POINT_TO_POINT:
                     # Link ID is Neighbor Router ID
                     neighbor_router_id = link.link_id
-                    if isinstance(neighbor_router_id, RouterID): # Ensure it's a RouterID
-                         # Add edge if neighbor also has a corresponding Router LSA (implicitly, it exists as a node)
-                         # OSPF graph is typically of routers, so ensure neighbor_router_id is a router node
-                        if g.has_node(neighbor_router_id) and g.get_node_data(neighbor_router_id).get('type') == 'router':
-                            # Cost is from adv_router to neighbor_router_id
-                            g.add_edge(adv_router, neighbor_router_id, weight=link.metric)
+                    # For P2P links, link_id is RouterID (a str).
+                    # Rely on type hints and OSPF spec rather than isinstance with NewType.
+                    # Ensure neighbor_router_id is treated as the string ID it is.
+                    if g.has_node(str(neighbor_router_id)) and g.get_node_data(str(neighbor_router_id)).get('type') == 'router':
+                        g.add_edge(adv_router, str(neighbor_router_id), weight=link.metric)
                 
                 elif link.link_type == RouterLSALinkType.TRANSIT_NETWORK:
                     # Link ID is the IP address of the DR (which is the LSID of the Network LSA)
@@ -354,8 +362,8 @@ def build_ospf_graph_from_lsdb(
             # (The cost from router to pseudo-node is handled by Router LSA's transit link)
             for attached_rid in lsa_content.attached_routers:
                 if g.has_node(attached_rid) and g.get_node_data(attached_rid).get('type') == 'router':
-                    # Ensure edge is from pseudo_node to router with weight 0
-                    # The reverse (router to pseudo_node) is added by the Router LSA's transit link with actual cost
+                    # Ensure edge is from pseudo-node to router with weight 0
+                    # The reverse (router to pseudo-node) is added by the Router LSA's transit link with actual cost
                     if not g.has_edge(pseudo_node_id, attached_rid): # Avoid duplicates if any
                          g.add_edge(pseudo_node_id, attached_rid, weight=0)
     return g
@@ -372,25 +380,25 @@ class OSPFArea:
     # Intra-area topology graph for this area.
     topology_graph: Optional[Graph] = field(default=None, init=False) # Initialized by build method
     # Routing table for this area, calculated by SPF
-    # Maps: SourceRouterID -> DestinationNodeID (RouterID or PseudoNodeID) -> (Cost, NextHopID)
-    routing_table: Dict[RouterID, Dict[Union[RouterID, str], Tuple[float, Optional[Union[RouterID, str]]]]] = field(default_factory=dict)
+    # Maps: SourceRouterID -> DestinationNodeID (RouterID or PseudoNodeID) -> SPFResult
+    routing_table: Dict[RouterID, Dict[NodeID, SPFResult]] = field(default_factory=lambda: defaultdict(dict))
 
 
     def build_area_topology_from_lsdb(self) -> None:
-        \"\"\"
+        """
         Builds or rebuilds the intra-area topology graph from the area's LSDB.
-        \"\"\"
+        """
         self.topology_graph = build_ospf_graph_from_lsdb(self.lsdb, self.area_id)
         # print(f"Area {self.area_id}: Topology graph built/rebuilt from LSDB.")
         self.recalculate_spf() # Recalculate SPF after topology changes
 
 
     def add_lsa_to_lsdb(self, lsa: Union[RouterLSA, NetworkLSA, LSAHeader], source_router: Optional[OSPFRouter] = None) -> bool:
-        \"\"\"
+        """
         Adds or updates an LSA in the area's LSDB.
         Performs basic validation (e.g., sequence number, age, checksum).
         Returns True if LSA was added/updated and SPF needs recalculation, False otherwise.
-        \"\"\"
+        """
         lsa_key = (lsa.ls_type, lsa.link_state_id, lsa.advertising_router)
         current_lsa = self.lsdb.get(lsa_key)
         
@@ -440,16 +448,16 @@ class OSPFArea:
         return changed
 
     def recalculate_spf(self) -> None:
-        \"\"\"
+        """
         Recalculates SPF for the area using Dijkstra on the current topology_graph.
         Updates self.routing_table.
-        \"\"\"
+        """
         if not self.topology_graph or not self.topology_graph.get_all_nodes():
             self.routing_table.clear()
             # print(f"Area {self.area_id}: SPF not run. Graph empty or not built.")
             return
 
-        new_routing_table: Dict[RouterID, Dict[Union[RouterID, str], Tuple[float, Optional[Union[RouterID, str]]]]] = {}
+        new_routing_table: Dict[RouterID, Dict[NodeID, SPFResult]] = {}
         
         # We only run SPF from actual router nodes, not pseudo-nodes.
         router_nodes_in_graph = [
@@ -505,7 +513,7 @@ class OSPFArea:
 
 
                 # Store route: Destination can be another router or a pseudo-node (network)
-                new_routing_table[source_router_id][dest_node_id] = (cost, next_hop)
+                new_routing_table[source_router_id][dest_node_id] = SPFResult(cost=cost, next_hop_router_id=next_hop)
         
         self.routing_table = new_routing_table
         # print(f"Area {self.area_id}: SPF calculation complete. Routing table entries: {sum(len(rt) for rt in self.routing_table.values())}")
