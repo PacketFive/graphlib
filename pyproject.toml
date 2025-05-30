@@ -1,23 +1,27 @@
 [project]
-name = "graphlib"
+name = "graph-lib"
 version = "0.1.0"
-description = "A minimal graph library for educational use"
-authors = [{ name = "Lev Pakhomov", email = "pakhomovlev@gmail.com" }]
-requires-python = ">=3.13.3"
+description = "A Python graph library with OSPF and Dijkstra algorithms."
+readme = "README.md"
+requires-python = ">=3.8"
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+]
 
-[tool.black]
-line-length = 88
-target-version = ["py310"]
-include = '\.py$'
-
-[tool.mypy]
-strict = true
-ignore_missing_imports = true
-
-[tool.pytest.ini_options]
-testpaths = ["tests"]
-addopts = "-ra"
+[project.urls]
+"Homepage" = "https://github.com/yourusername/graph-lib"  # Replace with your actual URL
+"Bug Tracker" = "https://github.com/yourusername/graph-lib/issues" # Replace with your actual URL
 
 [build-system]
 requires = ["setuptools>=61.0"]
 build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["graph_lib*"]
+exclude = ["tests*"]
+
+[tool.pytest.ini_options]
+pythonpath = ["."] 
