@@ -1,6 +1,9 @@
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import List, Union, NewType, Optional, Dict, Tuple
+import ipaddress # Import the ipaddress module
+from graph_lib.graph import Graph # Ensure Graph is imported if not already at top level of module
+from .algorithms import dijkstra # Import dijkstra
 
 # Represents an IP address, typically stored as a string for simplicity here.
 # In a more complete implementation, this might be an IPv4Address or IPv6Address object.
@@ -48,6 +51,7 @@ class RouterLSALink:
     link_id: Union[RouterID, IPAddress] # Neighbor Router ID or IP Address of DR or Network IP
     link_data: Union[IPAddress, int] # Interface IP Address or Subnet Mask (if stub, then network IP)
                                      # For unnumbered P2P, this is Interface ID / MIB-II ifIndex
+                                     # For transit network, this is router's own IP on that network.
     link_type: RouterLSALinkType
     metric: int # Cost of this link
     # TOS (Type of Service) metrics can be added if needed
@@ -69,13 +73,9 @@ class RouterLSA(LSAHeader):
         self._calculate_length()
 
     def _calculate_length(self):
-        # Header (20 bytes) + flags (2 bytes, though OSPFv2 packs it in 1 for V,E,B + 1 reserved) + num_links (2 bytes) + links data
-        # For simplicity, assume flags and num_links are part of the body calc
-        # OSPF Router LSA body starts with 2 bytes for flags (V, E, B, and 5 reserved bits) and 2 bytes for # links
-        # Then each link is 12 bytes: Link ID (4), Link Data (4), Type (1), #TOS (1), Metric (2)
-        # (We are simplifying TOS for now, so Type(1), Reserved(1), Metric(2))
-        body_length = 4 # V/E/B flags (simplified as bools, but would be bitmask) + Number of Links (implicit from list len)
-        body_length += sum(12 for _ in self.links) # Each link approx 12 bytes
+        # OSPF Router LSA body: flags (2 bytes), num_links (2 bytes), links data (12 bytes each)
+        body_length = 4 # V/E/B flags + Number of Links
+        body_length += sum(12 for _ in self.links) # Each link is 12 bytes
         self.length = 20 + body_length
 
     def add_link(self, link: RouterLSALink):
@@ -93,13 +93,12 @@ class NetworkLSA(LSAHeader):
         super().__post_init__()
         self.ls_type = LSAType.NETWORK_LSA
         # Link State ID for Network LSA is the IP Interface Address of the DR
-        # (Here, we expect it to be set appropriately by the caller, or derived)
         self._calculate_length()
 
     def _calculate_length(self):
         # Header (20 bytes) + Network Mask (4 bytes) + Attached Routers (4 bytes each)
         body_length = 4 # Network Mask
-        body_length += len(self.attached_routers) * 4 # Each RouterID
+        body_length += len(self.attached_routers) * 4 # Each RouterID is 4 bytes
         self.length = 20 + body_length
 
     def add_attached_router(self, router_id: RouterID):
@@ -115,12 +114,12 @@ class OSPFInterfaceState(Enum):
     DOWN = 0
     LOOPBACK = 1
     WAITING = 2
-    POINT_TO_POINT = 3 # Indicates the network type is P2P for OSPF
-    BROADCAST = 4      # Indicates the network type is Broadcast (DR/BDR election occurs)
-    NBMA = 5           # Non-Broadcast Multi-Access (DR/BDR election occurs)
+    POINT_TO_POINT = 3 
+    BROADCAST = 4      
+    NBMA = 5           
     POINT_TO_MULTIPOINT = 6
     # Interface states on a segment (result of DR election etc.)
-    DR_OTHER = 7 # OSPF state machine state on interface
+    DR_OTHER = 7 
     BDR = 8
     DR = 9
 
@@ -129,145 +128,238 @@ class OSPFInterface:
     ip_address: IPAddress
     network_mask: IPAddress
     area_id: AreaID
-    network_type: OSPFInterfaceState = OSPFInterfaceState.BROADCAST # Default to broadcast
+    network_type: OSPFInterfaceState = OSPFInterfaceState.BROADCAST 
     cost: int = 10
-    # State after DR election, or for P2P link FSM.
-    # For simplicity, we might just use network_type to decide link formation for now.
     current_ospf_state: OSPFInterfaceState = OSPFInterfaceState.DR_OTHER 
-    hello_interval: int = 10 # seconds
-    dead_interval: int = 40  # seconds
-    priority: int = 1        # Router priority for DR/BDR election
+    hello_interval: int = 10 
+    dead_interval: int = 40  
+    priority: int = 1        
     
-    # For point-to-point links, explicitly define the peer
-    # This helps in manually constructing the topology graph
-    neighbor_router_id: Optional[RouterID] = None
-    neighbor_interface_ip: Optional[IPAddress] = None # For matching P2P if needed
+    neighbor_router_id: Optional[RouterID] = None # For P2P links
+    neighbor_interface_ip: Optional[IPAddress] = None # For P2P or DR's IP on multi-access
+    # Helper: if this interface is on a segment where a DR exists, this is the DR's Router ID
+    # This would be learned via Hello protocol or configuration
+    designated_router_id: Optional[RouterID] = None 
+    # Helper: IP address of the DR on this segment (used as Link ID in Router LSA's transit link)
+    designated_router_ip_on_segment: Optional[IPAddress] = None
+
 
 @dataclass
 class OSPFRouter:
     router_id: RouterID
+    is_abr: bool = False # Area Border Router
+    is_asbr: bool = False # Autonomous System Boundary Router
     interfaces: List[OSPFInterface] = field(default_factory=list)
-    # Link State Database (LSDB) for this router, could be per area
-    # lsdb: Dict[AreaID, Dict[Tuple[LSAType, RouterID, IPAddress], Union[RouterLSA, NetworkLSA, ...]]] = field(default_factory=dict)
+    
+    # Store generated LSAs, perhaps useful for inspection or flooding simulation
+    generated_lsas: List[Union[RouterLSA, NetworkLSA]] = field(default_factory=list)
+
 
     def add_interface(self, interface: OSPFInterface):
         self.interfaces.append(interface)
 
-    # Conceptual: A real OSPF implementation would build LSAs from its interface states and LSDB
     def originate_router_lsa(self, area_id: AreaID) -> Optional[RouterLSA]:
-        """Conceptual: Originates a Router LSA for its links in a given area."""
-        links_in_area = []
-        # This is highly simplified. Real LSA generation is complex.
+        links_for_lsa: List[RouterLSALink] = []
+        active_in_area = False
+
         for iface in self.interfaces:
-            if iface.area_id == area_id:
-                # Determine link type, link_id, link_data based on interface state, network type, neighbors
-                # This requires a more dynamic view of the network which we don't have yet
-                # For now, let's imagine a point-to-point link for simplicity if we had a neighbor concept here
-                pass # Placeholder
-        
-        if not links_in_area: # No interfaces in this area or no links formed
-            # Still, a router LSA might be originated if the router itself is in the area,
-            # possibly with no links or just stub links if configured
-            pass 
+            if iface.area_id != area_id or iface.current_ospf_state == OSPFInterfaceState.DOWN:
+                continue
+            active_in_area = True
 
-        # For now, this function is a placeholder for the complex LSA generation logic.
-        # Actual LSA generation would involve checking adjacencies, DR status, etc.
-        # For example, a link to a transit network involves the DR's IP as Link ID.
-        # A link to a P2P neighbor involves the neighbor's Router ID.
-        # A stub link involves the network IP/mask.
-        
-        # Example of how one might start building it:
-        # router_lsa = RouterLSA(
-        #     advertising_router=self.router_id, 
-        #     link_state_id=self.router_id, # For Router LSA, LSID is its own RID
-        #     # ... other header fields ...
-        #     links=links_in_area
-        # )
-        # router_lsa._calculate_length() # Ensure length is set
-        # return router_lsa
-        return None # Placeholder until more logic is added
+            if iface.network_type == OSPFInterfaceState.POINT_TO_POINT:
+                if iface.neighbor_router_id: # Assuming adjacency is up
+                    links_for_lsa.append(RouterLSALink(
+                        link_id=iface.neighbor_router_id,
+                        link_data=iface.ip_address, # Router's own interface IP
+                        link_type=RouterLSALinkType.POINT_TO_POINT,
+                        metric=iface.cost
+                    ))
+            elif iface.network_type in [OSPFInterfaceState.BROADCAST, OSPFInterfaceState.NBMA]:
+                if iface.designated_router_ip_on_segment: # DR exists on this segment
+                    links_for_lsa.append(RouterLSALink(
+                        link_id=iface.designated_router_ip_on_segment, # Link ID is DR's IP address
+                        link_data=iface.ip_address, # Link Data is router's own IP address
+                        link_type=RouterLSALinkType.TRANSIT_NETWORK,
+                        metric=iface.cost
+                    ))
+                else: # No DR, maybe a stub? (Simplified: consider it stub if no DR)
+                      # Or if it's a segment where this router is the only one.
+                      # Real stub networks are identified differently (e.g. passive-interface or network type)
+                      # For simplicity, if it's a broadcast/NBMA interface but no DR info, treat as stub link.
+                      # This needs careful definition of what a "stub network" means in this context.
+                      # A true stub network (Type 3 link in Router LSA) has no other routers.
+                      # If it's a segment like 192.168.1.0/24 with only this router, it's a stub.
+                      # Link ID: Network IP, Link Data: Network Mask
+                    network_addr = get_network_address(iface.ip_address, iface.network_mask)
+                    links_for_lsa.append(RouterLSALink(
+                        link_id=network_addr, # Network IP
+                        link_data=iface.network_mask, # Network Mask
+                        link_type=RouterLSALinkType.STUB_NETWORK,
+                        metric=iface.cost
+                    ))
+            # TODO: Add logic for STUB_NETWORK links if an interface is explicitly a stub
+            # (e.g. loopbacks, or configured as passive and part of OSPF)
+            # For a loopback, typically advertised as a stub link.
+            elif iface.network_type == OSPFInterfaceState.LOOPBACK:
+                 links_for_lsa.append(RouterLSALink(
+                    link_id=iface.ip_address, # Network number (host route)
+                    link_data=IPAddress("255.255.255.255"), # Mask for host route
+                    link_type=RouterLSALinkType.STUB_NETWORK,
+                    metric=iface.cost 
+                 ))
 
-    def originate_network_lsa(self, interface_ip: IPAddress) -> Optional[NetworkLSA]:
-        """Conceptual: Originates a Network LSA if this router is DR on that segment."""
-        # Find the interface
-        target_iface = next((iface for iface in self.interfaces if iface.ip_address == interface_ip), None)
-        if not target_iface or target_iface.current_ospf_state != OSPFInterfaceState.DR:
-            return None # Only DR originates Network LSAs
 
-        # Attached routers would be discovered via Hello protocol on this segment
-        # For now, this list would need to be populated manually or by a higher-level process
-        attached_routers_on_segment: List[RouterID] = [] # Placeholder
-        # if self.router_id not in attached_routers_on_segment: # DR includes itself
-        #    attached_routers_on_segment.append(self.router_id)
+        if not active_in_area and not self.is_abr and not self.is_asbr : # Only generate if active or special router type
+             # A router might still generate an LSA if it's an ABR/ASBR even with no active links in *this* specific area
+             # but for intra-area graph, it needs links or being special.
+             # If no links and not ABR/ASBR, it might not need to advertise a router LSA for this area.
+             # However, OSPF usually requires router LSA if router is in the area.
+             # Let's assume it should always generate if it has interfaces in the area.
+             pass
 
-        # network_lsa = NetworkLSA(
-        #     advertising_router=self.router_id,
-        #     link_state_id=target_iface.ip_address, # For Network LSA, LSID is DR's interface IP
-        #     network_mask=target_iface.network_mask,
-        #     attached_routers=attached_routers_on_segment
-        #     # ... other header fields ...
-        # )
-        # network_lsa._calculate_length()
-        # return network_lsa
-        return None # Placeholder 
+
+        # Create the Router LSA
+        router_lsa = RouterLSA(
+            ls_age=0, # Will be set by LSDB aging
+            options=0, # Simplified
+            advertising_router=self.router_id,
+            link_state_id=self.router_id, # Router LSA's LSID is its own RID
+            is_abr=self.is_abr,
+            is_asbr=self.is_asbr,
+            is_virtual_link_endpoint=False, # Simplified
+            links=links_for_lsa
+        )
+        # _calculate_length is called in __post_init__
+        self.generated_lsas.append(router_lsa)
+        return router_lsa
+
+    def originate_network_lsa(self, dr_interface: OSPFInterface, attached_router_ids: List[RouterID]) -> Optional[NetworkLSA]:
+        if dr_interface.current_ospf_state != OSPFInterfaceState.DR or \
+           dr_interface.network_type not in [OSPFInterfaceState.BROADCAST, OSPFInterfaceState.NBMA]:
+            return None # Only DR on broadcast/NBMA originates Network LSAs
+
+        # Ensure DR itself is in the list of attached routers
+        all_attached_rids = list(set(attached_router_ids + [self.router_id]))
+
+        network_lsa = NetworkLSA(
+            ls_age=0,
+            options=0,
+            advertising_router=self.router_id,
+            link_state_id=dr_interface.ip_address, # Network LSA's LSID is DR's interface IP
+            network_mask=dr_interface.network_mask,
+            attached_routers=all_attached_rids
+        )
+        # _calculate_length is called in __post_init__
+        self.generated_lsas.append(network_lsa)
+        return network_lsa
 
 # --- OSPF Topology Building --- #
 
-from graph_lib.graph import Graph # Ensure Graph is imported if not already at top level of module
-
-def build_ospf_graph_from_routers(routers: List[OSPFRouter], target_area_id: AreaID) -> Graph:
+def build_ospf_graph_from_lsdb(
+    lsdb: Dict[Tuple[LSAType, Union[IPAddress, RouterID], RouterID], Union[LSAHeader, RouterLSA, NetworkLSA]],
+    target_area_id: AreaID # Not strictly needed if LSDB is already area-specific, but good for clarity
+    ) -> Graph:
     """
-    Builds a topology graph for a specific OSPF area from a list of OSPFRouter objects.
-    Nodes in the graph are RouterIDs. Node data is the OSPFRouter object.
+    Builds an OSPF topology graph for a specific area from its Link State Database (LSDB).
+    Nodes in the graph are RouterIDs and pseudo-nodes for transit networks (derived from Network LSAs).
     Edges represent OSPF links with costs as weights.
-
-    Currently focuses on Point-to-Point links based on neighbor_router_id.
-    Transit networks (Broadcast/NBMA) with DRs and pseudo-nodes will be a future addition.
     """
     g = Graph()
+    router_nodes: Dict[RouterID, Dict] = {} # Stores router_id -> data (e.g. ABR/ASBR status)
 
-    # Add all routers in the target area as nodes
-    routers_in_area_map: Dict[RouterID, OSPFRouter] = {}
-    for router in routers:
-        # A router is considered part of the area if any of its interfaces are in that area.
-        # For graph construction, we add the router if it *could* participate.
-        # The LSAs it generates would be area-specific.
-        is_in_target_area = any(iface.area_id == target_area_id for iface in router.interfaces)
-        if is_in_target_area:
-            if router.router_id not in g:
-                g.add_node(router.router_id, data=router)
-            routers_in_area_map[router.router_id] = router
+    # Pass 1: Add all routers from Router LSAs and Network LSAs as nodes
+    for lsa_key, lsa_content in lsdb.items():
+        lsa_type, ls_id, adv_router = lsa_key
+        
+        # Add advertising router if not already present
+        if adv_router not in g:
+            g.add_node(adv_router, data={'type': 'router', 'is_abr': False, 'is_asbr': False}) # Initial flags
 
-    # Add edges for point-to-point links within the target area
-    for router_id, router_obj in routers_in_area_map.items():
-        for iface in router_obj.interfaces:
-            if iface.area_id == target_area_id and \
-               iface.network_type == OSPFInterfaceState.POINT_TO_POINT and \
-               iface.neighbor_router_id:
+        if isinstance(lsa_content, RouterLSA):
+            # Update ABR/ASBR flags for the advertising router
+            node_data = g.get_node_data(adv_router)
+            if node_data: # Should exist
+                node_data['is_abr'] = lsa_content.is_abr
+                node_data['is_asbr'] = lsa_content.is_asbr
+                # g.add_node(adv_router, data=node_data) # Re-add to update, or modify in place if Graph allows
+
+            for link in lsa_content.links:
+                if link.link_type == RouterLSALinkType.POINT_TO_POINT:
+                    neighbor_router_id = link.link_id
+                    if isinstance(neighbor_router_id, RouterID) and neighbor_router_id not in g:
+                        g.add_node(neighbor_router_id, data={'type': 'router', 'is_abr': False, 'is_asbr': False})
+                # Other link types might also imply router existence, but P2P is explicit.
+        
+        elif isinstance(lsa_content, NetworkLSA):
+            # Network LSA's Link State ID is the DR's interface IP, which acts as pseudo-node ID
+            pseudo_node_id = f"transit_{ls_id}" # ls_id here is DR's IP
+            if pseudo_node_id not in g:
+                g.add_node(pseudo_node_id, data={'type': 'pseudo_node', 
+                                                 'dr_ip': ls_id, 
+                                                 'mask': lsa_content.network_mask,
+                                                 'adv_router': adv_router # DR's RouterID
+                                                 })
+            # Add all attached routers from Network LSA as nodes
+            for attached_rid in lsa_content.attached_routers:
+                if attached_rid not in g:
+                    g.add_node(attached_rid, data={'type': 'router', 'is_abr': False, 'is_asbr': False})
+
+    # Pass 2: Add edges based on LSAs
+    for lsa_key, lsa_content in lsdb.items():
+        lsa_type, ls_id, adv_router = lsa_key
+
+        if isinstance(lsa_content, RouterLSA):
+            # adv_router is the source of these links
+            for link in lsa_content.links:
+                if link.link_type == RouterLSALinkType.POINT_TO_POINT:
+                    # Link ID is Neighbor Router ID
+                    neighbor_router_id = link.link_id
+                    if isinstance(neighbor_router_id, RouterID): # Ensure it's a RouterID
+                         # Add edge if neighbor also has a corresponding Router LSA (implicitly, it exists as a node)
+                         # OSPF graph is typically of routers, so ensure neighbor_router_id is a router node
+                        if g.has_node(neighbor_router_id) and g.get_node_data(neighbor_router_id).get('type') == 'router':
+                            # Cost is from adv_router to neighbor_router_id
+                            g.add_edge(adv_router, neighbor_router_id, weight=link.metric)
                 
-                # Check if neighbor is also in the target area and exists in our map
-                if iface.neighbor_router_id in routers_in_area_map:
-                    # Add directed edge from current router to neighbor
-                    # Cost is taken from the current router's interface
-                    g.add_edge(router_id, iface.neighbor_router_id, weight=iface.cost)
+                elif link.link_type == RouterLSALinkType.TRANSIT_NETWORK:
+                    # Link ID is the IP address of the DR (which is the LSID of the Network LSA)
+                    # This corresponds to the pseudo_node_id
+                    dr_ip_on_segment = link.link_id 
+                    pseudo_node_id = f"transit_{dr_ip_on_segment}"
                     
-                    # Conceptual: In real OSPF, an adjacency requires bidirectional checks
-                    # and matching interface parameters. Here we assume if one side is defined
-                    # to point to a known router, the link is up for graph purposes.
-                    # A more robust check would find the neighbor's corresponding interface
-                    # and ensure it also points back and parameters match.
+                    if g.has_node(pseudo_node_id):
+                        # Router connects to pseudo-node with its interface cost (link.metric)
+                        g.add_edge(adv_router, pseudo_node_id, weight=link.metric)
+                    # else: pseudo-node should have been created in Pass 1 from a Network LSA.
+                    # If not, there's an inconsistency or missing Network LSA.
 
-    # TODO: Handle Transit Networks (Broadcast, NBMA)
-    # This would involve: 
-    # 1. Identifying DR for each transit segment in the target area.
-    # 2. Creating a pseudo-node for each transit segment (Network LSA representation).
-    #    - Node ID for pseudo-node could be f"net_{DR_IP_on_segment}"
-    #    - Node data could be the Network LSA itself (if we generate/store it).
-    # 3. Connecting DR to its pseudo-node with cost 0.
-    # 4. Connecting other routers on that segment to the pseudo-node with their interface cost.
-    # 5. (Implicitly, SPF runs from router, through pseudo-node (cost 0 from DR, or if_cost from other), then 0 to other routers on segment)
+                # STUB_NETWORK links from Router LSA are for calculating routes to networks,
+                # but don't form edges to other *routers* in the SPF graph directly.
+                # They represent leaf networks. These are handled by Dijkstra when calculating
+                # paths if pseudo-nodes are not used for them or if they are destinations.
+                # For now, graph primarily connects routers and pseudo-nodes representing multi-access segments.
 
+        elif isinstance(lsa_content, NetworkLSA):
+            # LSID is DR's IP, adv_router is DR's RouterID
+            pseudo_node_id = f"transit_{ls_id}" # ls_id is DR's IP
+            
+            if not g.has_node(pseudo_node_id):
+                # This should ideally not happen if Pass 1 was complete
+                # print(f"Warning: Pseudo-node {pseudo_node_id} not found for Network LSA from {adv_router}")
+                continue
+
+            # Connect all attached routers to this pseudo-node
+            # Cost from pseudo-node to an attached router is 0.
+            # (The cost from router to pseudo-node is handled by Router LSA's transit link)
+            for attached_rid in lsa_content.attached_routers:
+                if g.has_node(attached_rid) and g.get_node_data(attached_rid).get('type') == 'router':
+                    # Ensure edge is from pseudo_node to router with weight 0
+                    # The reverse (router to pseudo_node) is added by the Router LSA's transit link with actual cost
+                    if not g.has_edge(pseudo_node_id, attached_rid): # Avoid duplicates if any
+                         g.add_edge(pseudo_node_id, attached_rid, weight=0)
     return g
+
 
 @dataclass
 class OSPFArea:
@@ -275,57 +367,213 @@ class OSPFArea:
     # Routers that have at least one interface in this area.
     # This might be populated by a higher-level OSPF domain manager.
     routers_in_area: List[OSPFRouter] = field(default_factory=list) 
-    # Intra-area topology graph for this area.
-    topology_graph: Optional[Graph] = None
     # Link State Database for this area. Maps (LSAType, LSID, AdvRouter) -> LSA
-    # This is a simplified key; official LSDBs are more complex to index.
     lsdb: Dict[Tuple[LSAType, Union[IPAddress, RouterID], RouterID], Union[LSAHeader, RouterLSA, NetworkLSA]] = field(default_factory=dict)
+    # Intra-area topology graph for this area.
+    topology_graph: Optional[Graph] = field(default=None, init=False) # Initialized by build method
+    # Routing table for this area, calculated by SPF
+    # Maps: SourceRouterID -> DestinationNodeID (RouterID or PseudoNodeID) -> (Cost, NextHopID)
+    routing_table: Dict[RouterID, Dict[Union[RouterID, str], Tuple[float, Optional[Union[RouterID, str]]]]] = field(default_factory=dict)
 
-    def build_intra_area_topology(self, all_domain_routers: Optional[List[OSPFRouter]] = None) -> None:
-        """
-        Builds the intra-area topology graph for this specific area.
-        If all_domain_routers is provided, it filters them for this area.
-        Otherwise, it uses its own routers_in_area list.
-        """
-        routers_to_consider = self.routers_in_area
-        if all_domain_routers:
-            # Filter all_domain_routers to include only those relevant to this area
-            # A router is relevant if it has any interface in this area_id
-            routers_to_consider = [r for r in all_domain_routers if any(iface.area_id == self.area_id for iface in r.interfaces)]
-            # Update self.routers_in_area if it was empty or to ensure consistency
-            # This line might be too assertive depending on desired behavior, consider if self.routers_in_area
-            # should be the single source of truth once set.
-            self.routers_in_area = routers_to_consider 
+
+    def build_area_topology_from_lsdb(self) -> None:
+        \"\"\"
+        Builds or rebuilds the intra-area topology graph from the area's LSDB.
+        \"\"\"
+        self.topology_graph = build_ospf_graph_from_lsdb(self.lsdb, self.area_id)
+        # print(f"Area {self.area_id}: Topology graph built/rebuilt from LSDB.")
+        self.recalculate_spf() # Recalculate SPF after topology changes
+
+
+    def add_lsa_to_lsdb(self, lsa: Union[RouterLSA, NetworkLSA, LSAHeader], source_router: Optional[OSPFRouter] = None) -> bool:
+        \"\"\"
+        Adds or updates an LSA in the area's LSDB.
+        Performs basic validation (e.g., sequence number, age, checksum).
+        Returns True if LSA was added/updated and SPF needs recalculation, False otherwise.
+        \"\"\"
+        lsa_key = (lsa.ls_type, lsa.link_state_id, lsa.advertising_router)
+        current_lsa = self.lsdb.get(lsa_key)
         
-        if not routers_to_consider:
-            self.topology_graph = Graph() # Empty graph if no routers for this area
+        changed = False
+        if current_lsa is None:
+            self.lsdb[lsa_key] = lsa
+            changed = True
+        else:
+            # OSPF LSDB Update Rules (simplified):
+            # 1. Higher Sequence Number is preferred.
+            # 2. Same Sequence Number: Lower LS Age is preferred (unless MaxAge).
+            # 3. Same Sequence Number & Age: Higher Checksum is preferred. (Indicates different content)
+            # 4. MaxAge (3600s) LSAs: Handled for flushing. If new LSA is MaxAge, accept if current isn't or if seqnum is higher.
+            #    If current is MaxAge, new non-MaxAge LSA with same or higher seqnum can replace it.
+
+            if lsa.ls_sequence_number > current_lsa.ls_sequence_number:
+                changed = True
+            elif lsa.ls_sequence_number == current_lsa.ls_sequence_number:
+                if lsa.ls_checksum != current_lsa.ls_checksum: # Different content
+                    if lsa.ls_age < current_lsa.ls_age : # Prefer newer if checksum differs
+                         changed = True
+                    # If ages are same but checksums differ, it's unusual but implies an update.
+                    # RFC 2328 implies checksum is checked before seq num for identical instances.
+                    # Let's assume for identical (Seq, Age, Type, LSID, AdvRtr), checksum implies content change.
+                    # But standard is: if Seq, Age, Checksum are identical, it's a duplicate.
+                    # If Seq is same, prefer one with smaller age OR if one is MaxAge and other isn't.
+                
+                # If sequence and checksum are same, compare age.
+                # An LSA with MaxAge (3600) means it should be flushed.
+                # A new LSA (even with same seq num) that isn't MaxAge can replace a MaxAge LSA.
+                # A new LSA with smaller age (and not MaxAge) is preferred.
+                if current_lsa.ls_age == 3600 and lsa.ls_age < 3600:
+                    changed = True
+                elif lsa.ls_age < current_lsa.ls_age and lsa.ls_age != 3600 : # Prefer fresher, non-MaxAge
+                    changed = True
+                # If new LSA is MaxAge and current is not, and seq num is same/higher
+                elif lsa.ls_age == 3600 and current_lsa.ls_age != 3600:
+                    changed = True
+
+
+            if changed:
+                self.lsdb[lsa_key] = lsa
+        
+        if changed:
+            # print(f"Area {self.area_id}: LSA {lsa_key} updated in LSDB. Triggering topology rebuild and SPF.")
+            self.build_area_topology_from_lsdb() # Rebuild graph and run SPF
+        return changed
+
+    def recalculate_spf(self) -> None:
+        \"\"\"
+        Recalculates SPF for the area using Dijkstra on the current topology_graph.
+        Updates self.routing_table.
+        \"\"\"
+        if not self.topology_graph or not self.topology_graph.get_all_nodes():
+            self.routing_table.clear()
+            # print(f"Area {self.area_id}: SPF not run. Graph empty or not built.")
             return
 
-        self.topology_graph = build_ospf_graph_from_routers(routers_to_consider, self.area_id)
-
-    def add_lsa_to_lsdb(self, lsa: Union[RouterLSA, NetworkLSA, LSAHeader]) -> None:
-        """Adds or updates an LSA in the area's LSDB."""
-        # Basic LSDB key: (LSAType, LinkStateID, AdvertisingRouter)
-        lsa_key = (lsa.ls_type, lsa.link_state_id, lsa.advertising_router)
+        new_routing_table: Dict[RouterID, Dict[Union[RouterID, str], Tuple[float, Optional[Union[RouterID, str]]]]] = {}
         
-        # Rudimentary LSDB update logic ( fresher LSA replaces older/same)
-        # Real OSPF LSDB update is more complex (sequence numbers, age, checksum)
-        if lsa_key not in self.lsdb or \
-           lsa.ls_sequence_number > self.lsdb[lsa_key].ls_sequence_number or \
-           (lsa.ls_sequence_number == self.lsdb[lsa_key].ls_sequence_number and lsa.ls_age < self.lsdb[lsa_key].ls_age) or \
-           lsa.ls_age == 3600: # MaxAge LSAs should be accepted to be flushed
-            self.lsdb[lsa_key] = lsa
-            # Potentially trigger SPF recalculation for this area if topology_graph exists
-            # self.recalculate_spf() 
+        # We only run SPF from actual router nodes, not pseudo-nodes.
+        router_nodes_in_graph = [
+            node_id for node_id in self.topology_graph.get_all_nodes() 
+            if self.topology_graph.get_node_data(node_id) and \
+               self.topology_graph.get_node_data(node_id).get('type') == 'router'
+        ]
 
-    # Placeholder for SPF calculation on the area's graph
-    # def recalculate_spf(self):
-    #     if self.topology_graph:
-    #         # For each router in the graph, run Dijkstra
-    #         for node_id in self.topology_graph.get_all_nodes():
-    #             distances, predecessors = dijkstra(self.topology_graph, node_id)
-    #             # Store these results, perhaps in the OSPFRouter object's data within the graph
-    #             # or in a separate routing table structure for the area.
-    #             pass
+        for source_router_id_anytype in router_nodes_in_graph:
+            source_router_id = RouterID(str(source_router_id_anytype)) # Ensure it's RouterID type
 
-# REMOVE THE MISPLACED return g at the end of the file by ensuring the file ends after the OSPFArea class definition. 
+            if source_router_id not in self.topology_graph: continue # Should be in graph
+
+            # distances: node -> cost, predecessors: node -> prev_node_on_path_from_source
+            distances, predecessors = dijkstra(self.topology_graph, start_node=source_router_id)
+            
+            new_routing_table[source_router_id] = {}
+
+            for dest_node_id_anytype, cost in distances.items():
+                if cost == float('inf'): # Unreachable
+                    continue
+                
+                # Ensure dest_node_id is consistently typed (str for pseudo, RouterID for router)
+                dest_node_id: Union[RouterID, str]
+                dest_node_data = self.topology_graph.get_node_data(dest_node_id_anytype)
+                if dest_node_data and dest_node_data.get('type') == 'router':
+                    dest_node_id = RouterID(str(dest_node_id_anytype))
+                else: # Assumed pseudo-node (string ID like "transit_...") or other non-router node
+                    dest_node_id = str(dest_node_id_anytype)
+
+
+                if dest_node_id == source_router_id: # Path to self
+                    next_hop = None 
+                else:
+                    # Reconstruct path to find the first hop from source_router_id
+                    curr = dest_node_id
+                    # Trace back until `prev` is source_router_id, then `curr` is the next hop
+                    prev = predecessors.get(curr) 
+                    if prev == source_router_id: # Direct neighbor is the first hop
+                        next_hop = curr
+                    else: # Need to trace back further
+                        while prev is not None and predecessors.get(prev) != source_router_id:
+                            curr = prev
+                            prev = predecessors.get(curr)
+                        # After loop, if prev is not None (i.e., path exists beyond direct connection to source),
+                        # then 'curr' is the first hop from the source.
+                        # If prev is None here, it means curr was source, handled above.
+                        # If predecessors.get(prev) is source_router_id, then prev is the next hop.
+                        if prev is not None : # prev is the next hop if loop terminated due to predecessors.get(prev) == source_router_id
+                             next_hop = prev if predecessors.get(prev) == source_router_id else curr
+                        else: # Should be covered by direct neighbor or self-path
+                             next_hop = curr if curr != source_router_id else None
+
+
+                # Store route: Destination can be another router or a pseudo-node (network)
+                new_routing_table[source_router_id][dest_node_id] = (cost, next_hop)
+        
+        self.routing_table = new_routing_table
+        # print(f"Area {self.area_id}: SPF calculation complete. Routing table entries: {sum(len(rt) for rt in self.routing_table.values())}")
+
+
+# Utility function to calculate network address
+def get_network_address(ip: IPAddress, mask: IPAddress) -> IPAddress:
+    try:
+        # Ensure ip and mask are strings for ipaddress module
+        ip_str = str(ip)
+        mask_str = str(mask)
+        network = ipaddress.IPv4Network(f'{ip_str}/{mask_str}', strict=False)
+        return IPAddress(str(network.network_address))
+    except ValueError:
+        # Fallback if ip/mask format is not valid for IPv4Network (e.g. RouterID used as IP)
+        # In a real OSPF, Link State IDs can be RouterIDs or IP Addresses depending on LSA type/link type
+        # This function is primarily for stub network calculation where IP/Mask are expected.
+        return ip # Return original IP as a last resort. Could log an error.
+
+# Example Usage (Conceptual - would be part of a larger OSPF simulation)
+# router1 = OSPFRouter(router_id=RouterID("1.1.1.1"))
+# router1.add_interface(OSPFInterface(ip_address=IPAddress("10.0.1.1"), network_mask=IPAddress("255.255.255.0"), area_id=AreaID("0.0.0.0"), network_type=OSPFInterfaceState.POINT_TO_POINT, cost=10, neighbor_router_id=RouterID("2.2.2.2")))
+# router2 = OSPFRouter(router_id=RouterID("2.2.2.2"))
+# router2.add_interface(OSPFInterface(ip_address=IPAddress("10.0.1.2"), network_mask=IPAddress("255.255.255.0"), area_id=AreaID("0.0.0.0"), network_type=OSPFInterfaceState.POINT_TO_POINT, cost=10, neighbor_router_id=RouterID("1.1.1.1")))
+# router3 = OSPFRouter(router_id=RouterID("3.3.3.3"))
+# # Interface on a broadcast network where R3 is DR
+# if_dr = OSPFInterface(ip_address=IPAddress("10.0.2.1"), network_mask=IPAddress("255.255.255.0"), area_id=AreaID("0.0.0.0"), network_type=OSPFInterfaceState.BROADCAST, cost=5, current_ospf_state=OSPFInterfaceState.DR, designated_router_ip_on_segment=IPAddress("10.0.2.1"), designated_router_id=RouterID("3.3.3.3"))
+# router3.add_interface(if_dr)
+# # R1 connects to this broadcast network, R3 is DR
+# r1_if_broadcast = OSPFInterface(
+#     ip_address=IPAddress("10.0.2.2"), 
+#     network_mask=IPAddress("255.255.255.0"), 
+#     area_id=AreaID("0.0.0.0"), 
+#     network_type=OSPFInterfaceState.BROADCAST, 
+#     cost=10, 
+#     current_ospf_state=OSPFInterfaceState.DR_OTHER, 
+#     designated_router_ip_on_segment=IPAddress("10.0.2.1"), # R1 knows DR's IP
+#     designated_router_id=RouterID("3.3.3.3") # R1 knows DR's RID
+# )
+# router1.add_interface(r1_if_broadcast)
+
+# # Simulate LSAs being generated and added to LSDB
+# area0 = OSPFArea(area_id=AreaID("0.0.0.0"))
+
+# # Routers generate their LSAs
+# r1_lsa = router1.originate_router_lsa(area_id=AreaID("0.0.0.0"))
+# r2_lsa = router2.originate_router_lsa(area_id=AreaID("0.0.0.0"))
+# r3_lsa = router3.originate_router_lsa(area_id=AreaID("0.0.0.0"))
+
+# if r1_lsa: area0.add_lsa_to_lsdb(r1_lsa)
+# if r2_lsa: area0.add_lsa_to_lsdb(r2_lsa)
+# if r3_lsa: area0.add_lsa_to_lsdb(r3_lsa)
+
+# # R3 (DR on 10.0.2.0/24) originates Network LSA for that segment
+# # Attached routers on that segment are R1 and R3 itself.
+# net_lsa_r3 = router3.originate_network_lsa(dr_interface=if_dr, attached_router_ids=[RouterID("1.1.1.1")])
+# if net_lsa_r3: area0.add_lsa_to_lsdb(net_lsa_r3)
+
+# # At this point, area0.build_area_topology_from_lsdb() and area0.recalculate_spf() 
+# # would have been called internally by add_lsa_to_lsdb.
+
+# if area0.topology_graph:
+#     print("\nArea 0 Topology Graph:")
+#     print("Nodes:", area0.topology_graph.get_all_nodes(include_data=True))
+#     print("Edges:", area0.topology_graph.get_all_edges(include_weights=True))
+
+# print("\nArea 0 Routing Table (Contents):")
+# for src_rid, routes in area0.routing_table.items():
+#     print(f"  Routes from {src_rid}:")
+#     for dest_id, (cost, nexthop) in routes.items():
+#         print(f"    To {dest_id}: Cost={cost}, NextHop={nexthop}") 
